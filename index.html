@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Nutri</title>
+<meta name="theme-color" content="#0e1113">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Nutri">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="stylesheet" href="styles.css">
+<script src="vendor/html5-qrcode.min.js" defer></script>
+<script type="module" src="js/app.js"></script>
+</head>
+<body>
+<main id="view"><div class="muted center spacer">Caricamento…</div></main>
+<nav id="tabs">
+  <button data-tab="oggi" class="active"><span class="ico">🍽️</span>Oggi</button>
+  <button data-tab="aggiungi"><span class="ico">➕</span>Aggiungi</button>
+  <button data-tab="peso"><span class="ico">⚖️</span>Peso</button>
+  <button data-tab="settimana"><span class="ico">📊</span>Settimana</button>
+  <button data-tab="impostazioni"><span class="ico">⚙️</span>Impostazioni</button>
+</nav>
+<div id="sheet" class="sheet hidden"><div class="sheet-body"></div></div>
+<div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+</body>
+</html>
