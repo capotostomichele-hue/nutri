@@ -1,5 +1,5 @@
 // Service worker: app shell offline. Le chiamate a Open Food Facts vanno sempre in rete.
-const VERSION = "nutri-v2";
+const VERSION = "nutri-v3";
 const SHELL = ["./", "index.html", "styles.css", "js/app.js", "js/ui.js", "js/data.js", "foods.json",
   "vendor/html5-qrcode.min.js", "manifest.webmanifest", "icons/icon-192.png", "icons/apple-touch-icon.png"];
 self.addEventListener("install", e => { e.waitUntil(caches.open(VERSION).then(c => c.addAll(SHELL))); self.skipWaiting(); });

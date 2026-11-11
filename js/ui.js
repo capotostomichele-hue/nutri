@@ -24,6 +24,7 @@ async function bgStravaSync(from, to) {
   } catch (e) { console.warn("Strava:", e.message); }
 }
 
+const STRAVA_WORKER = "https://nutri-strava.capotosto-michele.workers.dev";
 const MEALS = [["colazione", "Colazione"], ["pranzo", "Pranzo"], ["cena", "Cena"], ["spuntini", "Spuntini"]];
 const NUT = Object.fromEntries(NUTRIENTS.map(n => [n.key, n]));
 const state = {date: todayISO(), meal: guessMeal(), tab: "oggi", query: ""};
@@ -591,7 +592,9 @@ async function renderImpostazioni(view) {
       <div class="muted small">I dati restano solo su questo telefono. Esporta una volta a settimana e mandalo al PC (AirDrop o "Salva su File"). Safari può cancellare i dati delle app non usate per settimane: esporta spesso.</div>
     </div>
     <div class="card"><div class="section-title">Strava</div>
-      <div id="stst" class="small muted">${settings.stravaUrl ? "Controllo collegamento…" : "Non configurato: apri il link di configurazione che ti ho preparato."}</div>
+      <div id="stst" class="small muted">${settings.stravaUrl ? "Controllo collegamento…" : "Non configurato: incolla la chiave dell'app (te la copio io negli appunti del Mac)."}</div>
+      ${settings.stravaUrl ? "" : `<input class="input" id="skey" placeholder="Chiave Strava" autocomplete="off" autocapitalize="off" spellcheck="false">
+      <button class="btn btn-primary" id="ssave">Salva chiave</button>`}
       ${settings.stravaUrl ? `<div class="grid2"><button class="btn btn-primary" id="stc">Collega Strava</button><button class="btn" id="sts">Sincronizza 30 giorni</button></div>
       <button class="btn btn-ghost small" id="std">Scollega Strava</button>` : ""}
       <div class="muted small">Le kcal di Strava sono solo informative: il target include già l'allenamento.</div>
@@ -610,6 +613,15 @@ async function renderImpostazioni(view) {
     </div></div>
     <div class="muted small center spacer">Dati nutrizionali: USDA FoodData Central (SR Legacy) e Open Food Facts (ODbL).</div>`;
 
+  if (!settings.stravaUrl) {
+    $("#ssave", view).onclick = async () => {
+      const k = $("#skey", view).value.trim();
+      if (k.length < 20) return toast("Chiave non valida");
+      await setSetting("stravaUrl", STRAVA_WORKER);
+      await setSetting("stravaKey", k);
+      toast("Chiave salvata: ora tocca \"Collega Strava\""); render();
+    };
+  }
   if (settings.stravaUrl) {
     const st = $("#stst", view);
     stravaStatus().then(s => { st.textContent = s.connected ? `Collegato${s.athlete ? " come " + s.athlete : ""}.` : "Non collegato: tocca \"Collega Strava\"."; })
