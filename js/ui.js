@@ -7,8 +7,22 @@ import {
   getSetting, setSetting, getSettings, loadBaseFoods,
   searchLocal, lookupBarcode, searchOnline,
   todayISO, addDays, formatDateIT, movingAverage, weeklyRate,
-  exportAll, toCSV, importAll, importCrescitaCSV, shareOrDownload, requestPersistence
+  exportAll, toCSV, importAll, importCrescitaCSV, shareOrDownload, requestPersistence,
+  stravaConfigured, stravaStatus, stravaDisconnect, stravaAuthUrl, syncStrava
 } from "./data.js";
+
+// Sincronizza Strava in background (al massimo ogni 10 minuti per lo stesso intervallo)
+const _syncSeen = {};
+async function bgStravaSync(from, to) {
+  const k = from + to;
+  if (Date.now() - (_syncSeen[k] || 0) < 600000) return;
+  if (!(await stravaConfigured())) return;
+  _syncSeen[k] = Date.now();
+  try {
+    const {changed} = await syncStrava(from, to);
+    if (changed && ["oggi", "settimana"].includes(state.tab)) render();
+  } catch (e) { console.warn("Strava:", e.message); }
+}
 
 const MEALS = [["colazione", "Colazione"], ["pranzo", "Pranzo"], ["cena", "Cena"], ["spuntini", "Spuntini"]];
 const NUT = Object.fromEntries(NUTRIENTS.map(n => [n.key, n]));
@@ -143,7 +157,11 @@ async function renderOggi(view) {
       <div class="row"><span>Zuccheri</span><span class="small">${fmt(tot.sugar, "g")}</span></div>
     </details>
     <div class="card"><div class="section-title">Allenamento e note</div>
-      <label class="small muted">Kcal allenamento (Strava/Garmin)</label>
+      ${(day?.strava || []).length ? `<div class="list">${day.strava.map(a => `<div class="list-item"><div><div>${esc(a.name)}</div>
+        <div class="muted small">${esc(a.type)} · ${a.moving_time_min} min${a.distance_km ? ` · ${nf(a.distance_km, 1)} km` : ""}</div></div>
+        <div class="small right">${a.kcal != null ? nf(a.kcal) + " kcal" : "kcal n.d."}</div></div>`).join("")}</div>
+        <div class="muted small">Da Strava</div>` : ""}
+      <label class="small muted">Kcal allenamento${day?.workoutSource === "strava" ? " (da Strava, modificabile)" : " (Strava/Garmin)"}</label>
       <input class="input" id="wk" type="number" inputmode="numeric" value="${isNum(day?.workoutKcal) ? day.workoutKcal : ""}">
       <label class="small muted">Note</label>
       <textarea class="input" id="note" rows="2">${esc(day?.note || "")}</textarea>
@@ -165,13 +183,17 @@ async function renderOggi(view) {
       await runExport("json"); render();
     }
   };
-  const saveDayField = async () => {
+  const saveDayField = async ev => {
+    const cur = (await getDay(state.date)) || {date: state.date};
     const w = num($("#wk").value);
-    await saveDay({date: state.date, workoutKcal: isNum(w) ? w : null, note: $("#note").value.trim()});
+    const rec = {...cur, date: state.date, workoutKcal: isNum(w) ? w : null, note: $("#note").value.trim()};
+    if (ev.target.id === "wk") rec.workoutSource = isNum(w) ? "manuale" : null; // un valore scritto a mano non viene sovrascritto da Strava
+    await saveDay(rec);
     toast("Salvato");
   };
   $("#wk").onchange = saveDayField;
   $("#note").onchange = saveDayField;
+  bgStravaSync(addDays(state.date, -1), state.date);
 }
 
 function entrySheet(entry) {
@@ -292,7 +314,9 @@ function foodSheet(food, grams) {
     <input class="input" id="fg" type="text" inputmode="decimal" value="${g0}">
     <div class="chips">${portions.map(([l, g]) => `<button class="chip" data-g="${g}">${esc(l)}${l === "100 g" ? "" : ` (${nf(g)} g)`}</button>`).join("")}</div>
     <div class="card preview" id="fp"></div>
+    ${isIncomplete(food) ? `<div class="warn small">Valori incompleti: tocca "Modifica valori" e copiali dall'etichetta.</div>` : ""}
     <button class="btn btn-primary" id="fa">Aggiungi a ${esc(mealLabel(state.meal))}</button>
+    ${food.source !== "base" ? `<button class="btn" id="fedit">✏️ Modifica valori</button>` : ""}
     ${food.source === "custom" ? `<button class="btn btn-danger" id="fdel">Elimina alimento</button>` : ""}`);
   const input = $("#fg", body);
   const prev = () => {
@@ -315,6 +339,7 @@ function foodSheet(food, grams) {
       state.query = "";
       if (state.tab === "aggiungi") render();
     }
+    if (ev.target.id === "fedit") { closeSheet(); customForm("", food); return; }
     if (ev.target.id === "fdel") {
       if (ev.target.dataset.armed) {
         await deleteFood(food.id); closeSheet(); toast("Alimento eliminato"); render();
@@ -343,6 +368,11 @@ function scannerSheet() {
     msg(`Cerco ${esc(code)}…`);
     try {
       const food = await lookupBarcode(code);
+      if (food && isIncomplete(food)) {
+        closeSheet();
+        customForm("", food, "Open Food Facts ha dati incompleti per questo prodotto: completa i valori dall'etichetta (verranno ricordati).");
+        return;
+      }
       if (food) { closeSheet(); foodSheet(food); return; }
       msg(`Prodotto ${esc(code)} non trovato su Open Food Facts.<br><button class="btn btn-primary" id="mk">Crea alimento con questo codice</button>`);
       $("#mk", body).onclick = () => { closeSheet(); customForm(code); };
@@ -360,20 +390,29 @@ function scannerSheet() {
     .catch(e => msg(`Fotocamera non disponibile (${esc(e?.message || e)}). Scrivi il codice qui sotto.`));
 }
 
-function customForm(barcode = "") {
+const REQUIRED = ["kcal", "prot", "carb", "fat"];
+const isIncomplete = f => REQUIRED.some(k => !isNum(f?.n?.[k]));
+
+// Nuovo alimento, oppure modifica/completamento di uno esistente (prodotto scansionato o personale)
+function customForm(barcode = "", existing = null, note = "") {
   const fields = [["kcal", "Calorie (kcal) *"], ["prot", "Proteine (g) *"], ["carb", "Carboidrati (g) *"], ["sugar", "di cui zuccheri (g)"],
     ["fat", "Grassi (g) *"], ["sat", "di cui saturi (g)"], ["fiber", "Fibre (g)"], ["salt", "Sale (g)"]];
+  const ex = existing?.n || {};
+  const val = k => k === "salt" ? (isNum(ex.na) ? Math.round(ex.na / 400 * 100) / 100 : "") : (isNum(ex[k]) ? Math.round(ex[k] * 100) / 100 : "");
+  const por0 = existing?.por?.[0];
+  const code = existing?.barcode || barcode;
   const body = openSheet(`
-    <div class="section-title">Nuovo alimento</div>
-    <input class="input" id="cn" placeholder="Nome *">
-    <input class="input" id="cb" placeholder="Marca (facoltativa)">
-    <input class="input" id="cc" inputmode="numeric" placeholder="Codice a barre (facoltativo)" value="${esc(barcode)}">
+    <div class="section-title">${existing ? "Modifica valori" : "Nuovo alimento"}</div>
+    ${note ? `<div class="warn small">${esc(note)}</div>` : ""}
+    <input class="input" id="cn" placeholder="Nome *" value="${esc(existing?.name || "")}">
+    <input class="input" id="cb" placeholder="Marca (facoltativa)" value="${esc(existing?.brand || "")}">
+    <input class="input" id="cc" inputmode="numeric" placeholder="Codice a barre (facoltativo)" value="${esc(code || "")}" ${existing ? "disabled" : ""}>
     <div class="section-title small">Valori per 100 g (dall'etichetta)</div>
-    <div class="grid2">${fields.map(([k, l]) => `<div><label class="small muted">${l}</label><input class="input" data-f="${k}" inputmode="decimal"></div>`).join("")}</div>
+    <div class="grid2">${fields.map(([k, l]) => `<div><label class="small muted">${l}</label><input class="input" data-f="${k}" inputmode="decimal" value="${val(k)}"></div>`).join("")}</div>
     <div class="section-title small">Porzione (facoltativa)</div>
-    <div class="grid2"><input class="input" id="pn" placeholder="es. 1 vasetto"><input class="input" id="pg" inputmode="decimal" placeholder="grammi"></div>
+    <div class="grid2"><input class="input" id="pn" placeholder="es. 1 vasetto" value="${esc(por0?.[0] || "")}"><input class="input" id="pg" inputmode="decimal" placeholder="grammi" value="${por0?.[1] ?? ""}"></div>
     <div id="cmsg" class="small warn-text"></div>
-    <button class="btn btn-primary" id="csave">Salva e aggiungi</button>`);
+    <button class="btn btn-primary" id="csave">${existing ? "Salva valori" : "Salva e aggiungi"}</button>`);
   $("#csave", body).onclick = async () => {
     const name = $("#cn", body).value.trim();
     const v = Object.fromEntries($$("[data-f]", body).map(i => [i.dataset.f, num(i.value)]));
@@ -381,16 +420,17 @@ function customForm(barcode = "") {
       $("#cmsg", body).textContent = "Compila nome, calorie, proteine, carboidrati e grassi.";
       return;
     }
-    const n = {};
-    for (const k of ["kcal", "prot", "carb", "sugar", "fat", "sat", "fiber"]) if (isNum(v[k])) n[k] = v[k];
-    if (isNum(v.salt)) n.na = v.salt * 400;
-    const code = $("#cc", body).value.replace(/\D/g, "");
+    // parto dai valori esistenti (micronutrienti di Open Food Facts restano), sovrascrivo quelli del modulo
+    const n = {...ex};
+    for (const k of ["kcal", "prot", "carb", "sugar", "fat", "sat", "fiber"]) { if (isNum(v[k])) n[k] = v[k]; else delete n[k]; }
+    if (isNum(v.salt)) n.na = v.salt * 400; else delete n.na;
+    const code = existing ? (existing.barcode || "") : $("#cc", body).value.replace(/\D/g, "");
     const pg = num($("#pg", body).value), pn = $("#pn", body).value.trim();
-    const food = {
-      id: code ? "off:" + code : "custom:" + crypto.randomUUID(),
-      name, brand: $("#cb", body).value.trim(), cat: "personale", source: "custom",
-      barcode: code || null, n, por: pn && pg > 0 ? [[pn, pg]] : []
-    };
+    const por = pn && pg > 0 ? [[pn, pg], ...(existing?.por || []).slice(1)] : (existing?.por || []).filter(p => p[0] !== por0?.[0]);
+    const food = existing
+      ? {...existing, name, brand: $("#cb", body).value.trim(), n, por, edited: true, updatedAt: Date.now()}
+      : {id: code ? "off:" + code : "custom:" + crypto.randomUUID(), name, brand: $("#cb", body).value.trim(),
+         cat: "personale", source: "custom", barcode: code || null, n, por};
     await saveFood(food);
     closeSheet();
     toast("Alimento salvato");
@@ -528,6 +568,7 @@ async function renderSettimana(view) {
     <div class="card"><div class="section-title">Medie vs obiettivi</div>
       ${NUTRIENTS.filter(n => n.key !== "kcal").map(n => barRow(n.key, avg[n.key], T[n.key])).join("")}
     </div>`;
+  bgStravaSync(from, state.date);
   view.onclick = ev => {
     const t = ev.target.closest("[data-nav]");
     if (!t) return;
@@ -549,6 +590,12 @@ async function renderImpostazioni(view) {
       <button class="btn" id="xc">Esporta CSV (per analisi)</button>
       <div class="muted small">I dati restano solo su questo telefono. Esporta una volta a settimana e mandalo al PC (AirDrop o "Salva su File"). Safari può cancellare i dati delle app non usate per settimane: esporta spesso.</div>
     </div>
+    <div class="card"><div class="section-title">Strava</div>
+      <div id="stst" class="small muted">${settings.stravaUrl ? "Controllo collegamento…" : "Non configurato: apri il link di configurazione che ti ho preparato."}</div>
+      ${settings.stravaUrl ? `<div class="grid2"><button class="btn btn-primary" id="stc">Collega Strava</button><button class="btn" id="sts">Sincronizza 30 giorni</button></div>
+      <button class="btn btn-ghost small" id="std">Scollega Strava</button>` : ""}
+      <div class="muted small">Le kcal di Strava sono solo informative: il target include già l'allenamento.</div>
+    </div>
     <div class="card"><div class="section-title">Importa</div>
       <label class="btn">Importa backup JSON<input type="file" id="ij" accept=".json,application/json" hidden></label>
       <label class="btn">Importa storico peso da Crescita (CSV)<input type="file" id="ic" accept=".csv,text/csv" hidden></label>
@@ -563,6 +610,22 @@ async function renderImpostazioni(view) {
     </div></div>
     <div class="muted small center spacer">Dati nutrizionali: USDA FoodData Central (SR Legacy) e Open Food Facts (ODbL).</div>`;
 
+  if (settings.stravaUrl) {
+    const st = $("#stst", view);
+    stravaStatus().then(s => { st.textContent = s.connected ? `Collegato${s.athlete ? " come " + s.athlete : ""}.` : "Non collegato: tocca \"Collega Strava\"."; })
+      .catch(e => { st.textContent = e.message; });
+    $("#stc", view).onclick = async () => { const u = await stravaAuthUrl(); if (u) window.open(u, "_blank"); };
+    $("#sts", view).onclick = async () => {
+      st.textContent = "Sincronizzo…";
+      try { await syncStrava(addDays(todayISO(), -29), todayISO()); st.textContent = "Sincronizzato."; }
+      catch (e) { st.textContent = e.message; }
+    };
+    $("#std", view).onclick = async ev => {
+      if (!ev.target.dataset.armed) { ev.target.dataset.armed = "1"; ev.target.textContent = "Tocca di nuovo per scollegare"; return; }
+      try { await stravaDisconnect(); toast("Strava scollegato"); } catch (e) { toast(e.message); }
+      render();
+    };
+  }
   $("#xj", view).onclick = async () => { await runExport("json"); render(); };
   $("#xc", view).onclick = async () => { await runExport("csv"); render(); };
   $("#ij", view).onchange = async e => {
@@ -595,10 +658,11 @@ export async function init() {
     try {
       const b64 = location.hash.slice(7).replace(/-/g, "+").replace(/_/g, "/");
       const json = decodeURIComponent(escape(atob(b64)));
-      const {targets, waistBaseline} = JSON.parse(json);
+      const {targets, waistBaseline, stravaUrl, stravaKey} = JSON.parse(json);
       if (targets) await setSetting("targets", targets);
       if (isNum(waistBaseline)) await setSetting("waistBaseline", waistBaseline);
-      toast("Obiettivi impostati");
+      if (stravaUrl && stravaKey) { await setSetting("stravaUrl", stravaUrl); await setSetting("stravaKey", stravaKey); }
+      toast(stravaUrl ? "Configurazione salvata: ora collega Strava dalle impostazioni" : "Configurazione salvata");
     } catch { toast("Link di configurazione non valido"); }
     history.replaceState(null, "", location.pathname + location.search);
   }

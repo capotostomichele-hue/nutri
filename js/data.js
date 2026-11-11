@@ -225,10 +225,10 @@ export async function searchLocal(query, limit = 30) {
 // ---------- 6. Open Food Facts ----------
 const OFF_FIELDS = "code,product_name,product_name_it,brands,nutriments,serving_quantity,serving_size";
 
-async function fetchTimeout(url, ms = 8000) {
+async function fetchTimeout(url, ms = 8000, opts = {}) {
   const ctrl = new AbortController();
   const id = setTimeout(() => ctrl.abort(), ms);
-  try { return await fetch(url, {signal: ctrl.signal}); }
+  try { return await fetch(url, {...opts, signal: ctrl.signal}); }
   finally { clearTimeout(id); }
 }
 
@@ -368,7 +368,7 @@ const r1 = v => isNum(v) ? Math.round(v * 10) / 10 : "";
 const r2 = v => isNum(v) ? Math.round(v * 100) / 100 : "";
 
 export function toCSV(data) {
-  const header = ["tipo","data","pasto","alimento","marca","grammi","kcal","prot","carb","fat","fiber","sugar","sat","na","k","mg","zn","se","vitd","omega3","peso_kg","girovita_cm","allenamento_kcal","nota"];
+  const header = ["tipo","data","pasto","alimento","marca","grammi","kcal","prot","carb","fat","fiber","sugar","sat","na","k","mg","zn","se","vitd","omega3","peso_kg","girovita_cm","allenamento_kcal","nota","attivita_strava"];
   const rows = [];
   const empty = () => Array(header.length).fill("");
   for (const e of data.entries || []) {
@@ -385,9 +385,10 @@ export function toCSV(data) {
     rows.push(r);
   }
   for (const d of data.days || []) {
-    if (!d.workoutKcal && !d.note) continue;
+    if (!d.workoutKcal && !d.note && !(d.strava || []).length) continue;
     const r = empty();
     r[0] = "giorno"; r[1] = d.date; r[22] = d.workoutKcal ?? ""; r[23] = d.note ?? "";
+    r[24] = (d.strava || []).map(a => `${a.type} ${a.name} ${a.moving_time_min}min${a.kcal != null ? " " + a.kcal + "kcal" : ""}`).join("; ");
     rows.push(r);
   }
   rows.sort((a, b) => a[1].localeCompare(b[1]));
@@ -469,4 +470,50 @@ export async function shareOrDownload(filename, content, mime) {
 
 export async function requestPersistence() {
   try { return !!(await navigator.storage?.persist?.()); } catch { return false; }
+}
+
+// ---------- 10. Strava (tramite Worker personale) ----------
+async function stravaCfg() {
+  const s = await getSettings();
+  return s.stravaUrl && s.stravaKey ? {url: s.stravaUrl.replace(/\/+$/, ""), key: s.stravaKey} : null;
+}
+export const stravaConfigured = async () => !!(await stravaCfg());
+
+async function stravaFetch(path, opts = {}) {
+  const cfg = await stravaCfg();
+  if (!cfg) throw new Error("Strava non configurato");
+  let res;
+  try { res = await fetchTimeout(cfg.url + path, 20000, {...opts, headers: {"X-App-Key": cfg.key, ...(opts.headers || {})}}); }
+  catch { throw new Error("Server Strava non raggiungibile"); }
+  const data = await res.json().catch(() => ({}));
+  if (res.status === 409) throw new Error("Strava non collegato: tocca \"Collega Strava\" nelle impostazioni");
+  if (res.status === 401) throw new Error("Chiave Strava non valida");
+  if (res.status === 429) throw new Error("Limite richieste Strava raggiunto, riprova tra 15 minuti");
+  if (!res.ok) throw new Error("Errore Strava (" + (data.error || res.status) + ")");
+  return data;
+}
+export const stravaStatus = () => stravaFetch("/status");
+export const stravaDisconnect = () => stravaFetch("/disconnect", {method: "POST"});
+export async function stravaAuthUrl() {
+  const cfg = await stravaCfg();
+  return cfg ? `${cfg.url}/auth?key=${encodeURIComponent(cfg.key)}` : null;
+}
+
+// Scarica le attività e aggiorna i giorni: Strava prevale sul dato manuale quando ci sono attività.
+export async function syncStrava(from, to) {
+  const data = await stravaFetch(`/days?from=${from}&to=${to}`);
+  const byDate = Object.fromEntries((data.days || []).map(d => [d.date, d]));
+  let changed = false;
+  for (let d = from; d <= to; d = addDays(d, 1)) {
+    const old = (await getDay(d)) || {date: d};
+    const s = byDate[d];
+    let rec;
+    if (s && old.workoutSource === "manuale") rec = {...old, strava: s.activities}; // il valore scritto a mano resta
+    else if (s) rec = {...old, workoutKcal: s.kcal, workoutSource: "strava", strava: s.activities};
+    else if (old.workoutSource === "strava") rec = {...old, workoutKcal: null, workoutSource: null, strava: []};
+    else continue;
+    if (JSON.stringify(rec) !== JSON.stringify(old)) { await saveDay(rec); changed = true; }
+  }
+  await setSetting("stravaLastSync", Date.now());
+  return {changed, athlete: data.athlete};
 }
